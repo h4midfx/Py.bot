@@ -1,225 +1,954 @@
 """
-ربات سیگنال SMC با اشتراک Telegram Stars  (TP1..TP5)
-
-نصب:   pip install "python-telegram-bot[job-queue]>=21.7" httpx pandas numpy
-اجرا:  BOT_TOKEN=xxx ADMIN_ID=123456 python signal_bot.py
-فایل smc.py باید کنار این فایل باشد.
+ربات سیگنال SMC با اشتراک Telegram Stars
+اجرا:  python signal_bot.py      (تنظیمات از متغیرهای محیطی؛ فایل .env.example را ببینید)
 """
-import os, time, json, sqlite3, asyncio, logging
+from __future__ import annotations
+import asyncio
+import json
+import logging
+import math
+import os
+import re
+import shutil
+import tempfile
+import time
+from datetime import datetime, timezone
+
 import httpx
-import pandas as pd
-from telegram import Update, LabeledPrice
-from telegram.error import Forbidden, BadRequest
-from telegram.ext import (Application, CommandHandler, PreCheckoutQueryHandler,
-                          MessageHandler, ContextTypes, filters)
+from telegram import Update, LabeledPrice, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Forbidden, RetryAfter, TelegramError
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+                          PreCheckoutQueryHandler, MessageHandler, filters)
+
+import backtest as bt
+import exchange as ex
 import smc
+from config import Config, load_config
+from database import Database
 
-logging.basicConfig(level=logging.INFO)
-TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-PRICE_STARS = int(os.getenv("PRICE_STARS", "500"))
-SUB_DAYS = int(os.getenv("SUB_DAYS", "30"))
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-MIN_SCORE = int(os.getenv("MIN_SCORE", "2"))   # 1=فقط OB ... 4=همه تاییدیه‌ها
-SCAN_EVERY = 300
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-           "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "SUIUSDT"]
-DISCLAIMER = ("⚠️ توصیه مالی نیست. فیوچرز با اهرم ریسک بالایی دارد و ممکن است کل سرمایه "
-              "از بین برود. ریسک هر معامله را حداکثر ۱ تا ۲٪ سرمایه نگه دارید.")
+log = logging.getLogger("signalbot")
 
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.executescript("""
-CREATE TABLE IF NOT EXISTS subs(user_id INTEGER PRIMARY KEY, expires INTEGER);
-CREATE TABLE IF NOT EXISTS payments(charge_id TEXT PRIMARY KEY, user_id INTEGER, stars INTEGER, ts INTEGER);
-CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, candle INTEGER,
-  side TEXT, entry REAL, sl REAL, tps TEXT, hits INTEGER DEFAULT 0, status TEXT DEFAULT 'open',
-  UNIQUE(symbol, candle, side));
-""")
-db.commit()
+DISCLAIMER = ("⚠️ توصیه مالی نیست. فیوچرز با اهرم ریسک بالایی دارد و ممکن است کل سرمایه از بین برود. "
+              "ریسک هر معامله را حداکثر ۱ تا ۲٪ سرمایه نگه دارید. نتایج گذشته تضمین آینده نیست.")
+CURRENCY = "XTR"
+RATE_SLEEP = 0.04  # ~25 پیام در ثانیه
 
 
-def is_active(uid):
-    r = db.execute("SELECT expires FROM subs WHERE user_id=?", (uid,)).fetchone()
-    return bool(r and r[0] > time.time())
+async def _sleep(s: float):  # جدا شده تا در تست قابل جایگزینی باشد
+    await asyncio.sleep(s)
 
 
-def extend(uid, days):
-    r = db.execute("SELECT expires FROM subs WHERE user_id=?", (uid,)).fetchone()
-    base = max(time.time(), r[0]) if r else time.time()
-    db.execute("INSERT OR REPLACE INTO subs VALUES(?,?)", (uid, int(base + days * 86400)))
-    db.commit()
+def _ctx(context):
+    return context.bot_data["cfg"], context.bot_data["db"]
 
 
-def active_users():
-    return [r[0] for r in db.execute("SELECT user_id FROM subs WHERE expires>?", (time.time(),))]
+def _mask(s: str) -> str:
+    return "…" + s[-4:] if s and len(s) > 4 else "…"
 
 
-async def fetch(client, symbol):
-    r = await client.get("https://fapi.binance.com/fapi/v1/klines",
-                         params={"symbol": symbol, "interval": TIMEFRAME, "limit": 500})
-    r.raise_for_status()
-    df = pd.DataFrame(r.json(), columns=["t", "o", "h", "l", "c", "v", "ct", "q", "n", "tb", "tq", "i"])
-    for col in ["o", "h", "l", "c"]:
-        df[col] = df[col].astype(float)
-    return df.iloc[:-1].reset_index(drop=True)   # فقط کندل بسته‌شده
-
-
-def fmt(p):  # قیمت با دقت مناسب
+def fmt(p: float) -> str:
     return f"{p:.2f}" if p >= 100 else f"{p:.4f}" if p >= 1 else f"{p:.6f}"
 
 
-def signal_text(sym, s):
+def fmt_date(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+# ============================================================ ارسال پیام امن
+async def safe_send(bot, uid: int, text: str, db: Database | None = None) -> str:
+    """'ok' | 'blocked' | 'failed'  — هیچ‌وقت استثنا بالا نمی‌دهد."""
+    for attempt in range(2):
+        try:
+            await bot.send_message(uid, text)
+            return "ok"
+        except Forbidden:
+            if db:
+                db.set_blocked(uid, True)
+            return "blocked"
+        except RetryAfter as e:
+            wait = getattr(e.retry_after, "total_seconds", lambda: e.retry_after)()
+            if attempt == 0:
+                await _sleep(float(wait) + 1)
+                continue
+            return "failed"
+        except (TelegramError, asyncio.TimeoutError) as e:
+            log.warning("send failed uid=%s: %s", uid, type(e).__name__)
+            return "failed"
+    return "failed"
+
+
+async def broadcast(bot, db: Database, user_ids, text: str) -> dict:
+    res = {"ok": 0, "blocked": 0, "failed": 0}
+    for uid in user_ids:
+        res[await safe_send(bot, uid, text, db)] += 1
+        await _sleep(RATE_SLEEP)
+    return res
+
+
+async def notify_admins(context, text: str):
+    cfg, _ = _ctx(context)
+    for aid in cfg.admin_ids:
+        await safe_send(context.bot, aid, text)
+
+
+async def post_channel(context, text: str):
+    cfg, _ = _ctx(context)
+    if cfg.channel_id:
+        await safe_send(context.bot, cfg.channel_id, text)
+
+
+# ============================================================ اعتبارسنجی فاکتور
+def validate_invoice(cfg: Config, payload: str, currency: str, amount: int, uid: int):
+    """(ok, پیام خطا، پلن). payload باید 'sub:<plan>:<uid>' و متعلق به همین کاربر باشد."""
+    parts = (payload or "").split(":")
+    if len(parts) != 3 or parts[0] != "sub":
+        return False, "سفارش نامعتبر است", None
+    plan = cfg.plan(parts[1])
+    if plan is None:
+        return False, "پلن نامعتبر است", None
+    if not parts[2].isdigit() or int(parts[2]) != uid:
+        return False, "این سفارش متعلق به شما نیست", None
+    if currency != CURRENCY:
+        return False, "ارز نامعتبر است", None
+    if amount != plan.stars:
+        return False, "مبلغ نامعتبر است", None
+    return True, None, plan
+
+
+# ============================================================ متن‌ها
+STOP_HINT = {"fixed": "",
+             "be": "🔒 بعد از TP1 حد ضرر را به نقطه‌ی ورود ببرید.\n",
+             "trail": "🔒 حد ضرر متحرک: بعد از TP1 → ورود، بعد از TP2 → TP1، بعد از TP3 → TP2 و ...\n"}
+
+
+def signal_text(sym: str, s: dict, tf: str, sid: int | None = None, test: bool = False, be: bool = False,
+                stop_mode: str = "fixed", fee: float | None = None) -> str:
     emoji = "🟢" if s["side"] == "LONG" else "🔴"
-    tags = [s["kind"]] + (["FVG"] if s["fvg"] else []) + (["Liquidity Sweep"] if s["swept"] else [])
-    tps = "\n".join(f"🎯 TP{i+1}: {fmt(x)}" for i, x in enumerate(s["tps"]))
-    return (f"{emoji} {s['side']} | {sym} | {TIMEFRAME}\n"
-            f"🧠 SMC: {' + '.join(tags)} + Order Block\n"
-            f"⭐ قدرت سیگنال: {s['score']}/4\n\n"
+    tags = [s["kind"]] + (["FVG"] if s["fvg"] else []) + (["Liquidity Sweep"] if s["swept"] else []) \
+        + (["HTF ✅"] if s.get("htf") == 1 else [])
+    tps = "\n".join(f"🎯 TP{i + 1}: {fmt(x)}" for i, x in enumerate(s["tps"]))
+    head = ("🧪 [تست] " if test else "") + f"{emoji} {s['side']} | {sym} | {tf}" + (f" | #{sid}" if sid else "")
+    return (f"{head}\n🧠 SMC: {' + '.join(tags)} + Order Block\n⭐ قدرت سیگنال: {s['score']}/4\n\n"
             f"📍 ورود: {fmt(s['entry'])}\n🛑 حد ضرر: {fmt(s['sl'])}\n{tps}\n\n"
-            f"💡 در هر TP حدود ۲۰٪ حجم ببندید.\n{DISCLAIMER}")
+            f"💡 در هر TP حدود ۲۰٪ حجم ببندید. محاسبه حجم: /risk\n"
+            + STOP_HINT["be" if (be and stop_mode == "fixed") else stop_mode]
+            + (f"💸 کارمزد رفت‌وبرگشت تقریبی: {smc.fee_cost_r(s['entry'], s['sl'], fee):.2f}R\n" if fee else "")
+            + DISCLAIMER)
 
 
-async def broadcast(context, text):
-    ok = 0
-    for uid in active_users():
+def sparkline(values) -> str:
+    """منحنی R تجمعی با بلوک‌های یونیکد (قدیم -> جدید)."""
+    if not values:
+        return ""
+    cum, acc = [], 0.0
+    for v in values:
+        acc += v
+        cum.append(acc)
+    lo, hi = min(cum), max(cum)
+    bars = "▁▂▃▄▅▆▇█"
+    if hi - lo < 1e-9:
+        return bars[3] * len(cum)
+    return "".join(bars[min(7, int((c - lo) / (hi - lo) * 7.999))] for c in cum)
+
+
+def perf_text(p: dict, title: str = "عملکرد ثبت‌شده‌ی ربات") -> str:
+    if not p["n"]:
+        return f"هنوز سیگنال بسته‌شده‌ای ثبت نشده است. (سیگنال باز: {p['open']})"
+    lines = [f"📊 {title} ({p['n']} سیگنال بسته‌شده، {p['open']} باز)",
+             f"• رسیدن به حداقل TP1: {p['tp1']:.0%}", f"• رسیدن به حداقل TP3: {p['tp3']:.0%}",
+             f"• رسیدن به TP5: {p['tp5']:.0%}", f"• برخورد به حد ضرر: {p['sl']:.0%}",
+             f"• میانگین نتیجه: {p['avg_r']:+.2f}R | سیگنال‌های مثبت: {p['win']:.0%}", "", "آخرین نتایج:"]
+    for r in p["recent"]:
+        mark = "✅" if r["r"] > 0 else "❌" if r["r"] < 0 else "➖"
+        lines.append(f"{mark} {r['symbol']} {r['side']} | TP{r['hits']} | {r['r']:+.2f}R")
+    if p["n"] < 30:
+        lines.append("\n⚠️ تعداد نمونه کم است (<۳۰)؛ این آمار هنوز معنی‌دار نیست.")
+    if p.get("series") and len(p["series"]) >= 3:
+        lines.append(f"\nمنحنی سرمایه (R تجمعی، {len(p['series'])} سیگنال اخیر):\n{sparkline(p['series'])}")
+    lines.append("نتایج گذشته تضمین آینده نیست.")
+    return "\n".join(lines)
+
+
+# ============================================================ دستورهای کاربر
+async def start(update, context):
+    cfg, db = _ctx(context)
+    u = update.effective_user
+    is_new = db.upsert_user(u.id, getattr(u, "username", None))
+    if is_new and context.args and context.args[0].startswith("ref_"):
         try:
-            await context.bot.send_message(uid, text); ok += 1
-        except (Forbidden, BadRequest):
+            db.set_referrer(u.id, int(context.args[0][4:]))
+        except ValueError:
             pass
-        await asyncio.sleep(0.05)
-    return ok
+    lines = ["سلام 👋", "سیگنال‌های فیوچرز بر پایه‌ی Smart Money Concepts (BOS/CHoCH، Order Block، FVG، Liquidity Sweep) "
+             "با ۵ هدف سود (TP1–TP5) و اطلاع‌رسانی لحظه‌ای هر هدف/حد ضرر.", ""]
+    lines += [f"💳 {p.label}: {p.stars} ⭐" for p in cfg.plans]
+    lines += ["", "/buy خرید اشتراک", "/status وضعیت اشتراک"]
+    if cfg.trial_days > 0:
+        lines.append(f"/trial تست رایگان {cfg.trial_days} روزه")
+    lines += ["/settings تنظیمات شخصی (حداقل امتیاز، جهت، اعلان TP/SL)", "/promo کد هدیه", "/open سیگنال‌های باز (مشترکان)", "/performance عملکرد ثبت‌شده", "/risk محاسبه حجم معامله", "/ref دعوت دوستان و دریافت روز رایگان",
+              "/terms قوانین | /paysupport پشتیبانی پرداخت", "", DISCLAIMER]
+    await update.message.reply_text("\n".join(lines))
 
 
-async def track_open(context, client):
-    """پیگیری سیگنال‌های باز و اطلاع‌رسانی TP/SL"""
-    for sid, sym, candle, side, sl, tps, hits in db.execute(
-            "SELECT id,symbol,candle,side,sl,tps,hits FROM signals WHERE status='open'").fetchall():
-        try:
-            df = await fetch(client, sym)
-        except Exception:
-            continue
-        tps, long_ = json.loads(tps), side == "LONG"
-        for _, row in df[df["t"] > candle].iterrows():
-            if (long_ and row["l"] <= sl) or (not long_ and row["h"] >= sl):
-                db.execute("UPDATE signals SET status='sl' WHERE id=?", (sid,)); db.commit()
-                await broadcast(context, f"🛑 {sym} {side}: حد ضرر فعال شد (بعد از {hits} TP).")
-                break
-            new = hits
-            while new < 5 and ((long_ and row["h"] >= tps[new]) or (not long_ and row["l"] <= tps[new])):
-                new += 1
-            if new > hits:
-                hits = new
-                done = hits == 5
-                db.execute("UPDATE signals SET hits=?, status=? WHERE id=?", (hits, "done" if done else "open", sid)); db.commit()
-                await broadcast(context, f"✅ {sym} {side}: TP{hits} لمس شد!" + (" 🏆 همه‌ی اهداف کامل شد" if done else ""))
-                if done:
-                    break
+async def buy(update, context):
+    cfg, _ = _ctx(context)
+    kb = [[InlineKeyboardButton(f"{p.label} ({p.days} روز) — {p.stars} ⭐", callback_data=f"buy:{p.id}")]
+          for p in cfg.plans]
+    await update.message.reply_text("پلن مورد نظر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
 
 
-async def scan(context: ContextTypes.DEFAULT_TYPE):
-    async with httpx.AsyncClient(timeout=15) as client:
-        for sym in SYMBOLS:
-            try:
-                df = await fetch(client, sym)
-            except Exception as e:
-                logging.warning("scan %s failed: %s", sym, e); continue
-            last = len(df) - 1
-            for s in smc.analyze(df):
-                if s["idx"] != last or s["score"] < MIN_SCORE:
-                    continue
-                cur = db.execute("INSERT OR IGNORE INTO signals(symbol,candle,side,entry,sl,tps) VALUES(?,?,?,?,?,?)",
-                                 (sym, s["candle"], s["side"], s["entry"], s["sl"], json.dumps(s["tps"])))
-                db.commit()
-                if cur.rowcount:      # جلوگیری از ارسال تکراری
-                    await broadcast(context, signal_text(sym, s))
-        await track_open(context, client)
+async def buy_button(update, context):
+    cfg, _ = _ctx(context)
+    q = update.callback_query
+    await q.answer()
+    plan = cfg.plan((q.data or "").split(":", 1)[-1]) if (q.data or "").startswith("buy:") else None
+    if plan is None:
+        return
+    uid = update.effective_user.id
+    await context.bot.send_invoice(
+        chat_id=uid, title=f"اشتراک سیگنال {plan.label}", description=f"{plan.days} روز دریافت سیگنال‌های SMC (TP1–TP5)",
+        payload=f"sub:{plan.id}:{uid}", currency=CURRENCY, prices=[LabeledPrice(plan.label, plan.stars)],
+        provider_token="")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "سلام 👋\nسیگنال‌های فیوچرز بر پایه‌ی Smart Money Concepts (BOS/CHoCH، Order Block، FVG، Liquidity Sweep) "
-        f"با ۵ هدف (TP1–TP5).\n\n💳 اشتراک {SUB_DAYS} روزه: {PRICE_STARS} ⭐\n"
-        "خرید: /buy\nوضعیت: /status\nپشتیبانی پرداخت: /paysupport\n\n" + DISCLAIMER)
-
-
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_invoice(
-        title=f"اشتراک سیگنال {SUB_DAYS} روزه", description="سیگنال‌های SMC فیوچرز با TP1 تا TP5",
-        payload=f"sub_{SUB_DAYS}d", currency="XTR", prices=[LabeledPrice("اشتراک", PRICE_STARS)], provider_token="")
-
-
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def precheckout(update, context):
+    cfg, _ = _ctx(context)
     q = update.pre_checkout_query
-    await q.answer(ok=q.invoice_payload.startswith("sub_"), error_message="پرداخت نامعتبر")
+    ok, err, _plan = validate_invoice(cfg, q.invoice_payload, q.currency, q.total_amount, q.from_user.id)
+    if not ok:
+        log.warning("pre_checkout rejected: %s", err)
+    await q.answer(ok=ok, error_message=None if ok else err)
 
 
-async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    p, uid = update.message.successful_payment, update.effective_user.id
-    db.execute("INSERT OR IGNORE INTO payments VALUES(?,?,?,?)",
-               (p.telegram_payment_charge_id, uid, p.total_amount, int(time.time())))
-    extend(uid, SUB_DAYS)
-    await update.message.reply_text(f"✅ پرداخت موفق. اشتراک شما {SUB_DAYS} روز فعال شد.")
-    await context.bot.send_message(ADMIN_ID, f"💰 {p.total_amount}⭐ از کاربر {uid} | charge: {p.telegram_payment_charge_id}")
+async def successful_payment(update, context):
+    cfg, db = _ctx(context)
+    sp, uid = update.message.successful_payment, update.effective_user.id
+    ok, err, plan = validate_invoice(cfg, sp.invoice_payload, sp.currency, sp.total_amount, uid)
+    if not ok:  # دفاع در عمق: هیچ اشتراکی فعال نمی‌شود
+        log.error("invalid successful_payment charge=%s reason=%s", _mask(sp.telegram_payment_charge_id), err)
+        await notify_admins(context, f"⚠️ پرداخت نامعتبر از کاربر {uid} ({err}). نیاز به بررسی دستی.\n"
+                                     f"charge: {sp.telegram_payment_charge_id}")
+        await safe_send(context.bot, uid, "پرداخت دریافت شد اما به‌صورت خودکار تایید نشد. لطفاً /paysupport را بزنید.")
+        return
+    res = db.record_payment(sp.telegram_payment_charge_id, uid, sp.total_amount, plan.id, plan.days, cfg.ref_bonus_days)
+    if res["status"] == "duplicate":
+        log.info("duplicate payment ignored charge=%s", _mask(sp.telegram_payment_charge_id))
+        await safe_send(context.bot, uid, "این پرداخت قبلاً ثبت شده است ✅")
+        return
+    await safe_send(context.bot, uid, f"✅ پرداخت موفق. اشتراک {plan.label} تا {fmt_date(res['expires'])} (UTC) فعال است.")
+    await notify_admins(context, f"💰 {sp.total_amount}⭐ ({plan.id}) از کاربر {uid}\ncharge: {sp.telegram_payment_charge_id}")
+    if res["referrer"]:
+        await safe_send(context.bot, res["referrer"], f"🎁 دوست دعوت‌شده‌ی شما خرید کرد؛ {cfg.ref_bonus_days} روز اشتراک هدیه گرفتید!")
 
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    r = db.execute("SELECT expires FROM subs WHERE user_id=?", (update.effective_user.id,)).fetchone()
-    if r and r[0] > time.time():
-        await update.message.reply_text(f"✅ اشتراک فعال — {(r[0]-time.time())/86400:.1f} روز باقی مانده")
+async def status(update, context):
+    cfg, db = _ctx(context)
+    exp, now = db.expires_at(update.effective_user.id), time.time()
+    if exp > now:
+        await update.message.reply_text(f"✅ اشتراک فعال — {(exp - now) / 86400:.1f} روز باقی مانده (تا {fmt_date(exp)} UTC)")
     else:
-        await update.message.reply_text("❌ اشتراک فعال ندارید. /buy")
+        extra = " یا /trial" if cfg.trial_days > 0 else ""
+        await update.message.reply_text(f"❌ اشتراک فعال ندارید. /buy{extra}")
 
 
-async def paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("مشکل پرداخت یا بازگشت وجه: @YOUR_SUPPORT_USERNAME")
+async def trial(update, context):
+    cfg, db = _ctx(context)
+    if cfg.trial_days <= 0:
+        return await update.message.reply_text("تست رایگان فعال نیست. /buy")
+    u = update.effective_user
+    db.upsert_user(u.id, getattr(u, "username", None))
+    if db.start_trial(u.id, cfg.trial_days):
+        await update.message.reply_text(f"🎁 تست رایگان {cfg.trial_days} روزه فعال شد. سیگنال‌ها را همین‌جا دریافت می‌کنید.")
+    else:
+        await update.message.reply_text("تست رایگان قبلاً استفاده شده یا اشتراک فعال دارید. /buy")
 
 
+async def ref(update, context):
+    cfg, db = _ctx(context)
+    me = context.bot_data.get("bot_username")
+    if not me:
+        me = context.bot_data["bot_username"] = (await context.bot.get_me()).username
+    uid = update.effective_user.id
+    await update.message.reply_text(
+        f"لینک دعوت شما:\nhttps://t.me/{me}?start=ref_{uid}\n\n"
+        f"هر دوستی که با این لینک وارد شود و اولین خریدش را انجام دهد، {cfg.ref_bonus_days} روز اشتراک رایگان می‌گیرید.")
+
+
+async def performance(update, context):
+    _, db = _ctx(context)
+    await update.message.reply_text(perf_text(db.performance()))
+
+
+async def risk(update, context):
+    """/risk موجودی درصد_ریسک ورود حد_ضرر"""
+    try:
+        bal, pct, entry, sl = (float(x) for x in context.args[:4])
+        if len(context.args) < 4 or not all(map(math.isfinite, (bal, pct, entry, sl))):
+            raise ValueError
+        if bal <= 0 or not 0 < pct <= 100 or entry <= 0 or sl <= 0 or entry == sl:
+            raise ValueError
+    except (ValueError, TypeError):
+        return await update.message.reply_text("استفاده: /risk موجودی درصد_ریسک قیمت_ورود حد_ضرر\nمثال: /risk 1000 1 144.41 142.57")
+    risk_amt = bal * pct / 100
+    qty = risk_amt / abs(entry - sl)
+    notional = qty * entry
+    await update.message.reply_text(
+        f"💰 ریسک: {risk_amt:.2f}\n📦 حجم: {qty:.6g} واحد\n💵 ارزش موقعیت: {notional:.2f}\n"
+        f"⚙️ اهرم لازم (تقریبی): {notional / bal:.1f}x\n(کارمزد و لغزش در نظر گرفته نشده است)")
+
+
+async def paysupport(update, context):
+    cfg, _ = _ctx(context)
+    who = f"@{cfg.support_username}" if cfg.support_username else "ادمین ربات"
+    await update.message.reply_text(f"مشکل پرداخت یا درخواست بازگشت وجه: پیام به {who}\n(شناسه‌ی کاربری خود را بفرستید: {update.effective_user.id})")
+
+
+async def terms(update, context):
+    await update.message.reply_text(
+        "قوانین:\n• سیگنال‌ها آموزشی/اطلاعاتی‌اند و توصیه مالی نیستند.\n• هیچ سودی تضمین نمی‌شود و ضرر ممکن است.\n"
+        "• اشتراک خدمت دیجیتال است؛ بازگشت وجه فقط در صورت مشکل فنی پرداخت و با بررسی پشتیبانی (/paysupport).\n"
+        "• مسئولیت معاملات با خود شماست.")
+
+
+def settings_view(cfg: Config, st: dict):
+    ms = st["min_score"]
+    eff = max(ms or 0, cfg.min_score)
+    text = ("⚙️ تنظیمات شما\n"
+            f"• حداقل امتیاز سیگنال: {ms if ms else 'پیش‌فرض'} (اثر واقعی: {eff}؛ حداقل سراسری ربات {cfg.min_score} است)\n"
+            f"• جهت: {({'ALL': 'همه', 'LONG': 'فقط خرید (LONG)', 'SHORT': 'فقط فروش (SHORT)'})[st['side']]}\n"
+            f"• اعلان TP/SL: {'روشن' if st['progress'] else 'خاموش'}\n\n"
+            "امتیاز بالاتر = سیگنال کمتر و گزینش‌شده‌تر.")
+    mark = lambda cond, label: ("✅ " if cond else "") + label
+    kb = [[InlineKeyboardButton(mark((ms or 0) == n, f"امتیاز {n}+"), callback_data=f"set:ms:{n}") for n in (1, 2, 3, 4)],
+          [InlineKeyboardButton(mark(st["side"] == v, label), callback_data=f"set:side:{v}")
+           for v, label in (("ALL", "همه"), ("LONG", "خرید"), ("SHORT", "فروش"))],
+          [InlineKeyboardButton(mark(st["progress"], "اعلان TP/SL روشن"), callback_data="set:prog:1"),
+           InlineKeyboardButton(mark(not st["progress"], "خاموش"), callback_data="set:prog:0")]]
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def settings_cmd(update, context):
+    cfg, db = _ctx(context)
+    u = update.effective_user
+    db.upsert_user(u.id, getattr(u, "username", None))
+    text, kb = settings_view(cfg, db.get_settings(u.id))
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def settings_button(update, context):
+    cfg, db = _ctx(context)
+    q, uid = update.callback_query, update.effective_user.id
+    await q.answer()
+    parts = (q.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "set":
+        return
+    _, key, val = parts
+    ok = False
+    if key == "ms" and val.isdigit():
+        ok = db.set_setting(uid, "min_score", int(val))
+    elif key == "side":
+        ok = db.set_setting(uid, "side", val)
+    elif key == "prog" and val in ("0", "1"):
+        ok = db.set_setting(uid, "progress", val == "1")
+    if ok:
+        text, kb = settings_view(cfg, db.get_settings(uid))
+        await q.edit_message_text(text, reply_markup=kb)
+
+
+PROMO_MAX_FAILS, PROMO_WINDOW = 5, 3600
+PROMO_MSG = {"not_found": "کد نامعتبر است.", "expired": "این کد منقضی شده است.",
+             "exhausted": "ظرفیت این کد تمام شده است.", "already": "شما قبلاً از این کد استفاده کرده‌اید."}
+
+
+async def promo(update, context):
+    _, db = _ctx(context)
+    u = update.effective_user
+    code = (context.args[0] if context.args else "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,20}", code):
+        return await update.message.reply_text("استفاده: /promo کد")
+    now = time.time()
+    fails = [t for t in context.bot_data.setdefault("promo_fail", {}).get(u.id, []) if now - t < PROMO_WINDOW]
+    context.bot_data["promo_fail"][u.id] = fails
+    if len(fails) >= PROMO_MAX_FAILS:                      # جلوگیری از حدس‌زدن کد
+        return await update.message.reply_text("تعداد تلاش ناموفق زیاد بود. حدود یک ساعت دیگر دوباره امتحان کنید.")
+    db.upsert_user(u.id, getattr(u, "username", None))
+    r = db.redeem_promo(code, u.id)
+    if r["status"] == "not_found":
+        fails.append(now)
+    if r["status"] == "ok":
+        await update.message.reply_text(f"🎁 {r['days']} روز اشتراک هدیه فعال شد (تا {fmt_date(r['expires'])} UTC).")
+    else:
+        await update.message.reply_text(PROMO_MSG[r["status"]])
+
+
+async def open_cmd(update, context):
+    cfg, db = _ctx(context)
+    uid = update.effective_user.id
+    if uid not in cfg.admin_ids and not db.is_active(uid):
+        return await update.message.reply_text("مشاهده‌ی سیگنال‌های باز فقط برای مشترکان است. /buy")
+    rows = db.open_signals()
+    if not rows:
+        return await update.message.reply_text("فعلاً سیگنال بازی وجود ندارد.")
+    lines = ["📂 سیگنال‌های باز:"]
+    for r in rows:
+        tps = json.loads(r["tps"])
+        nxt = f"هدف بعدی TP{r['hits'] + 1}: {fmt(tps[r['hits']])}" if r["hits"] < 5 else "همه‌ی اهداف"
+        lines.append(f"\n#{r['id']} {r['symbol']} {r['side']} | ورود {fmt(r['entry'])} | SL {fmt(r['sl'])}\n"
+                     f"   تا اکنون: TP{r['hits']} | {nxt}")
+    lines.append("\n⚠️ اگر قیمت از نقطه‌ی ورود دور شده، دنبال آن وارد نشوید؛ منتظر ستاپ بعدی بمانید.")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ============================================================ دستورهای ادمین
 def admin_only(fn):
-    async def w(update, context):
-        if update.effective_user.id == ADMIN_ID:
-            await fn(update, context)
-    return w
-
-
-@admin_only
-async def signal_cmd(update, context):
-    text = " ".join(context.args)
-    if not text:
-        return await update.message.reply_text("استفاده: /signal متن")
-    await update.message.reply_text(f"ارسال شد برای {await broadcast(context, text + chr(10)*2 + DISCLAIMER)} نفر")
-
-
-@admin_only
-async def grant(update, context):
-    extend(int(context.args[0]), int(context.args[1])); await update.message.reply_text("انجام شد")
+    async def wrapper(update, context):
+        cfg, _ = _ctx(context)
+        if update.effective_user.id in cfg.admin_ids:
+            return await fn(update, context)
+    wrapper.__name__ = fn.__name__
+    return wrapper
 
 
 @admin_only
 async def stats(update, context):
-    s, n = db.execute("SELECT COALESCE(SUM(stars),0), COUNT(*) FROM payments").fetchone()
-    sg = db.execute("SELECT COUNT(*), SUM(status='sl'), SUM(hits>=1), SUM(hits=5) FROM signals").fetchone()
+    _, db = _ctx(context)
+    s, p = db.stats(), db.performance(0)
+    perf = f"{p['n']} بسته‌شده | {p['open']} باز" + (f" | میانگین {p['avg_r']:+.2f}R" if p["n"] else "")
+    pct = lambda a, b: f"{a / b:.0%}" if b else "-"
+    funnel = (f"🔻 قیف فروش: کاربر→پرداخت {s['payers']}/{s['users']} ({pct(s['payers'], s['users'])}) | "
+              f"تریال→پرداخت {s['trial_paid']}/{s['trials']} ({pct(s['trial_paid'], s['trials'])}) | دعوت‌شده‌ها: {s['referred']}\n")
     await update.message.reply_text(
-        f"مشترکان فعال: {len(active_users())}\nپرداخت‌ها: {n} | مجموع {s}⭐\n"
-        f"سیگنال‌ها: {sg[0]} | SL: {sg[1] or 0} | حداقل TP1: {sg[2] or 0} | کامل TP5: {sg[3] or 0}")
+        f"👥 کاربران: {s['users']} (بلاک‌کرده: {s['blocked']})\n✅ مشترک فعال: {s['active']} | تریال: {s['trials']}\n"
+        f"💳 پرداخت‌ها: {s['payments']} از {s['payers']} نفر | بازگشت: {s['refunds']}\n"
+        f"💰 درآمد: {s['revenue']}⭐ (۷ روز: {s['revenue_7d']} | ۳۰ روز: {s['revenue_30d']})\n{funnel}📈 سیگنال‌ها: {perf}")
+
+
+@admin_only
+async def grant(update, context):
+    cfg, db = _ctx(context)
+    try:
+        uid, days = int(context.args[0]), int(context.args[1])
+        if uid <= 0 or not 1 <= days <= 3650:
+            raise ValueError
+    except (ValueError, IndexError):
+        return await update.message.reply_text("استفاده: /grant USER_ID DAYS  (۱ تا ۳۶۵۰ روز)")
+    exp = db.grant(uid, days)
+    await safe_send(context.bot, uid, f"🎁 {days} روز اشتراک هدیه گرفتید (تا {fmt_date(exp)} UTC).")
+    await update.message.reply_text(f"انجام شد؛ اشتراک {uid} تا {fmt_date(exp)}")
+
+
+async def _send_text_cmd(update, context, everyone: bool):
+    _, db = _ctx(context)
+    text = " ".join(context.args).strip()
+    if not text or len(text) > 3500:
+        return await update.message.reply_text("متن لازم است (حداکثر ۳۵۰۰ کاراکتر).")
+    ids = db.all_user_ids() if everyone else db.active_user_ids()
+    r = await broadcast(context.bot, db, ids, text if everyone else f"{text}\n\n{DISCLAIMER}")
+    await update.message.reply_text(f"ارسال شد — موفق: {r['ok']} | بلاک: {r['blocked']} | ناموفق: {r['failed']}")
+
+
+@admin_only
+async def signal_cmd(update, context):
+    await _send_text_cmd(update, context, everyone=False)
+
+
+@admin_only
+async def announce(update, context):
+    await _send_text_cmd(update, context, everyone=True)
+
+
+@admin_only
+async def restore_handler(update, context):
+    """فایل پشتیبان (.db) را با کپشن «/restore CONFIRM» بفرستید؛ دیتابیس فعلی کاملاً جایگزین می‌شود."""
+    _, db = _ctx(context)
+    msg = update.message
+    doc = getattr(msg, "document", None)
+    if doc is None:
+        return
+    words = (msg.caption or "").split()
+    if len(words) < 2 or words[1] != "CONFIRM":
+        return await msg.reply_text("⚠️ این کار دیتابیس فعلی را کاملاً با این فایل جایگزین می‌کند (قبلش یک پشتیبان از وضعیت فعلی برایتان می‌فرستم).\n"
+                                    "برای تایید، همین فایل را با کپشن «/restore CONFIRM» دوباره بفرستید.")
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        return await msg.reply_text("فایل بزرگ‌تر از ۲۰ مگابایت است.")
+    folder = tempfile.mkdtemp()
+    try:
+        path = os.path.join(folder, "restore.db")
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(path)
+        db.validate_backup(path)                              # اول اعتبارسنجی؛ فایل بد هیچ چیزی را تغییر نمی‌دهد
+        await send_backup(context, update.effective_user.id)  # پشتیبان وضعیت فعلی
+        info = db.restore_from(path)
+    except ValueError as e:
+        return await msg.reply_text(f"❌ فایل نامعتبر است: {e}")
+    except (TelegramError, OSError) as e:
+        log.warning("restore failed: %s", type(e).__name__)
+        return await msg.reply_text("❌ دریافت فایل ناموفق بود.")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    await msg.reply_text(f"✅ بازیابی انجام شد — کاربران: {info['users']} | اشتراک‌ها: {info['subs']} | "
+                         f"پرداخت‌ها: {info['payments']} | سیگنال‌ها: {info['signals']}")
+
+
+@admin_only
+async def pause_cmd(update, context):
+    _, db = _ctx(context)
+    db.set_meta("paused", "1")
+    await update.message.reply_text("⏸ ارسال سیگنال جدید متوقف شد (ردیابی سیگنال‌های باز ادامه دارد). برای ادامه: /resume")
+
+
+@admin_only
+async def resume_cmd(update, context):
+    _, db = _ctx(context)
+    db.set_meta("paused", "0")
+    db.set_meta("loss_baseline", db.max_signal_id())       # شمارش باخت‌های پیاپی از همین‌جا دوباره شروع می‌شود
+    await update.message.reply_text("▶️ ارسال سیگنال از سر گرفته شد.")
+
+
+@admin_only
+async def health_cmd(update, context):
+    cfg, db = _ctx(context)
+    h = context.bot_data.get("health", {})
+    started = context.bot_data.get("started", time.time())
+    age = f"{int(time.time() - h['last_scan'])} ثانیه پیش" if h.get("last_scan") else "هنوز اجرا نشده"
+    size = os.path.getsize(cfg.db_path) / 1024 if cfg.db_path != ":memory:" and os.path.exists(cfg.db_path) else 0
+    s = db.stats()
+    await update.message.reply_text(
+        f"🩺 سلامت ربات\n• آپ‌تایم: {(time.time() - started) / 3600:.1f} ساعت\n"
+        f"• آخرین اسکن: {age} | نمادهای موفق: {h.get('ok_symbols', '-')}/{h.get('total_symbols', '-')} | شکست پیاپی: {h.get('fail_streak', 0)}\n"
+        f"• منبع داده: {cfg.exchange} | تایم‌فریم: {cfg.timeframe} | HTF: {('%dm' % (cfg.htf_ms // 60000)) if cfg.htf_ms else 'خاموش'}\n"
+        f"• وضعیت ارسال: {'⏸ متوقف' if is_paused(db) else '▶️ فعال'} | باخت پیاپی: {db.consecutive_losses(int(db.get_meta('loss_baseline') or 0))}"
+        f"{'/' + str(cfg.pause_after_losses) if cfg.pause_after_losses else ''}\n"
+        f"• ضربان: {int(time.time() - context.bot_data.get('heartbeat', started))} ثانیه پیش | نگهبان: "
+        f"{(str(cfg.watchdog_seconds) + 's') if cfg.watchdog_seconds else 'خاموش'}\n"
+        f"• سیگنال باز: {db.count_open()}" + (f"/{cfg.max_open}" if cfg.max_open else "")
+        + f" | امروز: {db.count_created_since(time.time() - 86400)}" + (f"/{cfg.max_per_day}" if cfg.max_per_day else "") + "\n"
+        f"• مشترک فعال: {s['active']} | دیتابیس: {size:.0f}KB | حد ضرر: {cfg.stop_mode}")
+
+
+@admin_only
+async def newpromo(update, context):
+    """/newpromo CODE DAYS MAXUSES [EXPIRES_IN_DAYS]"""
+    _, db = _ctx(context)
+    try:
+        code, days, maxu = context.args[0], int(context.args[1]), int(context.args[2])
+        exp_days = int(context.args[3]) if len(context.args) > 3 else None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{3,20}", code) or not 1 <= days <= 3650 or not 1 <= maxu <= 100000 \
+                or (exp_days is not None and not 1 <= exp_days <= 3650):
+            raise ValueError
+    except (ValueError, IndexError):
+        return await update.message.reply_text("استفاده: /newpromo CODE DAYS MAXUSES [EXPIRES_IN_DAYS]\nمثال: /newpromo WELCOME7 7 100 30")
+    ok = db.create_promo(code, days, maxu, int(time.time()) + exp_days * 86400 if exp_days else None)
+    await update.message.reply_text(f"✅ کد {code.upper()} ساخته شد ({days} روز، {maxu} بار)" if ok else "این کد قبلاً وجود دارد.")
+
+
+@admin_only
+async def promos(update, context):
+    _, db = _ctx(context)
+    rows = db.list_promos()
+    if not rows:
+        return await update.message.reply_text("کدی ثبت نشده است.")
+    await update.message.reply_text("\n".join(f"{r['code']}: {r['days']} روز | {r['used']}/{r['max_uses']}"
+                                              + (f" | تا {fmt_date(r['expires_ts'])}" if r["expires_ts"] else "") for r in rows))
+
+
+@admin_only
+async def backtest_cmd(update, context):
+    """/backtest [نماد|ALL] [روز]  — بک‌تست روی تاریخچه‌ی واقعی بایننس (۵ تا ۱۸۰ روز)"""
+    cfg, _ = _ctx(context)
+    target = context.args[0].upper() if context.args else cfg.symbols[0]
+    days = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 30
+    if not (target == "ALL" or target in cfg.symbols) or not 5 <= days <= 180:
+        return await update.message.reply_text(
+            f"استفاده: /backtest نماد|ALL روز\nنمادها: {', '.join(cfg.symbols)}\nروز: ۵ تا ۱۸۰")
+    await update.message.reply_text("⏳ در حال دریافت تاریخچه و اجرای بک‌تست... (ممکن است چند ده ثانیه طول بکشد)")
+    symbols = list(cfg.symbols) if target == "ALL" else [target]
+    try:
+        async with httpx.AsyncClient() as client:
+            trades, failed = await bt.run_symbols(client, symbols, cfg.timeframe, days, cfg.min_score, 0.0004,
+                                                  cfg.exchange_url, cfg.max_hold, cfg.http_timeout, cfg.http_retries,
+                                                  exchange=cfg.exchange, stop_mode=cfg.stop_mode, htf_ms=cfg.htf_ms,
+                                                  max_fee_r=cfg.max_fee_r)
+    except Exception as e:  # noqa: BLE001
+        log.warning("backtest failed: %s", type(e).__name__)
+        return await update.message.reply_text("بک‌تست ناموفق بود (مشکل شبکه/داده).")
+    title = (f"{target} | {cfg.exchange} | {cfg.timeframe} | {days} روز | MIN_SCORE={cfg.min_score}"
+             + (f" | STOP={cfg.stop_mode}" if cfg.stop_mode != "fixed" else "") + (f" | HTF={cfg.htf_ms // 60000}m" if cfg.htf_ms else "")
+             + (f" | MAX_FEE_R={cfg.max_fee_r}" if cfg.max_fee_r else ""))
+    text = bt.format_report(title, bt.summarize(trades), 0.0004)
+    if failed:
+        text += f"\n\n⚠️ دریافت داده ناموفق: {', '.join(failed)}"
+    await update.message.reply_text(text)
+
+
+async def send_backup(context, chat_id) -> bool:
+    _, db = _ctx(context)
+    folder = tempfile.mkdtemp()
+    try:
+        path = os.path.join(folder, f"backup_{datetime.now(timezone.utc):%Y%m%d_%H%M}.db")
+        db.backup_to(path)
+        with open(path, "rb") as f:
+            await context.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(path),
+                                            caption="🗄 پشتیبان دیتابیس (محرمانه؛ شامل شناسه‌ی کاربران)")
+        return True
+    except (TelegramError, OSError) as e:
+        log.warning("backup send failed: %s", type(e).__name__)
+        return False
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+@admin_only
+async def backup_cmd(update, context):
+    ok = await send_backup(context, update.effective_user.id)
+    if not ok:
+        await update.message.reply_text("ارسال پشتیبان ناموفق بود.")
 
 
 @admin_only
 async def refund(update, context):
-    uid = int(context.args[0])
-    await context.bot.refund_star_payment(uid, context.args[1])
-    db.execute("DELETE FROM subs WHERE user_id=?", (uid,)); db.commit()
-    await update.message.reply_text("بازگشت وجه انجام شد")
+    _, db = _ctx(context)
+    try:
+        uid, charge = int(context.args[0]), context.args[1]
+    except (ValueError, IndexError):
+        return await update.message.reply_text("استفاده: /refund USER_ID CHARGE_ID")
+    pay = db.get_payment(charge)
+    if not pay or pay["user_id"] != uid:
+        return await update.message.reply_text("پرداختی با این مشخصات پیدا نشد.")
+    if pay["refunded"]:
+        return await update.message.reply_text("این پرداخت قبلاً بازگردانده شده است.")
+    try:
+        await context.bot.refund_star_payment(user_id=uid, telegram_payment_charge_id=charge)
+    except TelegramError as e:
+        return await update.message.reply_text(f"بازگشت وجه ناموفق بود: {type(e).__name__} — دیتابیس تغییری نکرد.")
+    r = db.mark_refunded(charge)
+    await update.message.reply_text(f"✅ بازگشت وجه انجام شد ({r['status']}).")
+    await safe_send(context.bot, uid, "مبلغ پرداختی شما بازگردانده شد.")
+
+
+@admin_only
+async def testsignals(update, context):
+    """بررسی آزمایشی منطق روی داده‌ی مصنوعی. به هیچ کاربری پیام نمی‌دهد، چیزی در دیتابیس نمی‌نویسد."""
+    cfg, _ = _ctx(context)
+    seed = int(context.args[0]) if context.args and context.args[0].isdigit() else 1
+    df = smc.synthetic_candles(3000, seed)
+    sigs = smc.analyze(df)
+    bad = 0
+    for s in sigs:
+        t = s["tps"]
+        ok = (s["sl"] < s["entry"] < t[0] < t[4]) if s["side"] == "LONG" else (s["sl"] > s["entry"] > t[0] > t[4])
+        bad += not ok
+    cut = 2000
+    prefix = {(s["idx"], s["side"]) for s in smc.analyze(df.iloc[:cut].reset_index(drop=True))}
+    full = {(s["idx"], s["side"]) for s in sigs if s["idx"] < cut}
+    results = [smc.simulate(s, df) for s in sigs]
+    avg = sum(r["r"] for r in results) / len(results) if results else 0.0
+    await update.message.reply_text(
+        f"🧪 تست روی داده‌ی مصنوعی (seed={seed})\nسیگنال: {len(sigs)} | ترتیب SL/TP نامعتبر: {bad}\n"
+        f"عدم نگاه به آینده: {'✅ سالم' if prefix == full else '❌ مشکل'}\nمیانگین R روی داده‌ی مصنوعی: {avg:+.2f}\n"
+        "(این عدد هیچ ربطی به سودآوری واقعی ندارد. هیچ پیامی به کاربران ارسال نشد.)")
+    if sigs:
+        await update.message.reply_text(signal_text("TESTUSDT", sigs[0], cfg.timeframe, test=True, stop_mode=cfg.stop_mode, fee=cfg.fee_rate))
+
+
+# ============================================================ دریافت داده و اسکن
+async def fetch_klines(client, symbol: str, cfg: Config):
+    err = None
+    for attempt in range(cfg.http_retries):
+        try:
+            url, params = ex.build_request(cfg.exchange, cfg.exchange_url, symbol, cfg.timeframe, limit=500)
+            r = await client.get(url, params=params, timeout=cfg.http_timeout)
+            r.raise_for_status()
+            rows = ex.normalize(cfg.exchange, r.json(), cfg.timeframe)
+            return smc.klines_to_df(rows, now_ms=int(time.time() * 1000))
+        except (httpx.HTTPError, ValueError) as e:
+            err = e
+            if attempt < cfg.http_retries - 1:
+                await _sleep(2 ** attempt)
+    log.warning("fetch %s failed after retries: %s", symbol, type(err).__name__)
+    return None
+
+
+async def fetch_all(client, cfg: Config) -> dict:
+    sem = asyncio.Semaphore(cfg.concurrency)
+
+    async def one(sym):
+        async with sem:
+            return sym, await fetch_klines(client, sym, cfg)
+    return dict(await asyncio.gather(*(one(s) for s in cfg.symbols)))
+
+
+def is_paused(db: Database) -> bool:
+    return db.get_meta("paused") == "1"
+
+
+async def process_new_signals(context, dfs: dict, now_ms: int | None = None) -> int:
+    """
+    1) همه‌ی کاندیدها از همه‌ی نمادها جمع می‌شوند  2) بر اساس امتیاز مرتب می‌شوند
+    3) سقف سیگنال باز و سقف روزانه اعمال می‌شود  4) ذخیره (یکتا) و بعد ارسال به گیرندگانِ مجاز.
+    """
+    cfg, db = _ctx(context)
+    if is_paused(db):
+        return 0
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    tf_ms = smc.TF_MS[cfg.timeframe]
+    cands = []
+    for sym, df in dfs.items():
+        if df is None or len(df) < smc.MIN_CANDLES:
+            continue
+        last = len(df) - 1
+        if now_ms - (int(df["t"].iloc[last]) + tf_ms) > 3 * tf_ms:
+            log.warning("%s: candles are stale, skipped", sym)
+            continue
+        try:
+            sigs = smc.analyze(df, htf_ms=cfg.htf_ms, tf_ms=tf_ms)
+        except ValueError as e:
+            log.warning("%s: invalid data: %s", sym, e)
+            continue
+        for s in sigs:
+            if s["idx"] != last or s["score"] < cfg.min_score:
+                continue
+            if cfg.max_fee_r and smc.fee_cost_r(s["entry"], s["sl"], cfg.fee_rate) > cfg.max_fee_r:
+                log.info("%s: skipped, fee %.2fR > MAX_FEE_R", sym, smc.fee_cost_r(s["entry"], s["sl"], cfg.fee_rate))
+                continue
+            cands.append((s["score"], sym, s))
+    cands.sort(key=lambda x: -x[0])                      # قوی‌ترین‌ها اول (sort پایدار است)
+    sent = 0
+    for _, sym, s in cands:
+        if db.has_open(sym, s["side"]):
+            continue
+        if cfg.max_open and db.count_open() >= cfg.max_open:
+            log.info("max open signals reached (%d); skipping %s", cfg.max_open, sym)
+            break
+        if cfg.max_per_day and db.count_created_since(time.time() - 86400) >= cfg.max_per_day:
+            log.info("daily signal cap reached (%d)", cfg.max_per_day)
+            break
+        sid = db.insert_signal(sym, s["candle"], s["side"], s["entry"], s["sl"], s["tps"],
+                               s["score"], s["kind"], cfg.timeframe)
+        if sid is None:
+            continue
+        res = await broadcast(context.bot, db, db.recipients_for_signal(s["score"], s["side"]),
+                              signal_text(sym, s, cfg.timeframe, sid, stop_mode=cfg.stop_mode, fee=cfg.fee_rate))
+        sent += 1
+        await notify_admins(context, f"📤 سیگنال #{sid} {sym} {s['side']} (امتیاز {s['score']}) — موفق: {res['ok']} | بلاک: {res['blocked']} | ناموفق: {res['failed']}")
+    return sent
+
+
+async def track_open(context, dfs: dict) -> int:
+    """نتیجه را اول در دیتابیس ذخیره می‌کند و بعد اعلام می‌کند؛ پس هر هدف فقط یک‌بار اعلام می‌شود."""
+    cfg, db = _ctx(context)
+    tf_ms, changed = smc.TF_MS[cfg.timeframe], 0
+    for row in db.open_signals():
+        df = dfs.get(row["symbol"])
+        if df is None or df.empty:
+            continue
+        new = df[df["t"] > (row["last_t"] or row["candle"])]
+        if new.empty:
+            continue
+        tps = json.loads(row["tps"])
+        hits, events, outcome, used = smc.advance(row["side"], row["sl"], tps, row["hits"],
+                                                  new["h"].to_numpy(float), new["l"].to_numpy(float),
+                                                  entry=row["entry"], stop_mode=cfg.stop_mode)
+        last_t = int(new["t"].iloc[used - 1])
+        close = float(new["c"].iloc[used - 1])
+        if outcome is None and (last_t - row["candle"]) / tf_ms > cfg.max_hold:
+            outcome = "expired"
+        if not events and outcome is None:
+            db.update_signal(row["id"], hits, last_t)
+            continue
+        status_ = outcome or "open"
+        r = smc.realized_r(hits, outcome, row["entry"], row["sl"], row["side"], close) if outcome else None
+        db.update_signal(row["id"], hits, last_t, status_, r)   # اول ذخیره
+        changed += 1
+        lines = []
+        for kind, k in events:
+            lines.append(f"✅ TP{k} لمس شد" if kind == "tp" else
+                         f"🔒 قیمت به ورود برگشت؛ بسته شد بدون ضرر (بعد از {hits} هدف)" if kind == "be" else
+                         f"🔒 حد ضرر متحرک فعال شد؛ بسته شد با سود (بعد از {hits} هدف)" if kind == "trail" else
+                         f"🛑 حد ضرر فعال شد (بعد از {hits} هدف)")
+        if outcome == "done":
+            lines.append("🏆 همه‌ی اهداف کامل شد")
+        if outcome == "expired":
+            lines.append("⏱ سیگنال به‌دلیل گذشت زمان بسته شد")
+        if r is not None:
+            lines.append(f"نتیجه: {r:+.2f}R")
+        text = f"#{row['id']} {row['symbol']} {row['side']}\n" + "\n".join(lines)
+        await broadcast(context.bot, db, db.recipients_for_signal(row["score"] or 0, row["side"], progress=True), text)
+        await post_channel(context, text)
+    return changed
+
+
+async def check_breaker(context) -> bool:
+    """اگر باخت‌های پیاپی به سقف رسید، ارسال سیگنال جدید را متوقف می‌کند (ردیابی سیگنال‌های باز ادامه دارد)."""
+    cfg, db = _ctx(context)
+    if not cfg.pause_after_losses or is_paused(db):
+        return False
+    base = int(db.get_meta("loss_baseline") or 0)
+    n = db.consecutive_losses(after_id=base)
+    if n >= cfg.pause_after_losses:
+        db.set_meta("paused", "1")
+        await notify_admins(context, f"⏸ توقف خودکار: {n} باخت پیاپی. ارسال سیگنال جدید متوقف شد.\n"
+                                     "بعد از بررسی استراتژی/بازار با /resume ادامه دهید.")
+        return True
+    return False
+
+
+async def record_scan_health(context, dfs: dict) -> None:
+    """اگر دریافت داده چند بار پشت‌سرهم کاملاً شکست بخورد (مثلاً مسدودی IP)، به ادمین هشدار می‌دهد."""
+    cfg, _ = _ctx(context)
+    h = context.bot_data.setdefault("health", {"fail_streak": 0, "alerted": False})
+    ok = sum(df is not None for df in dfs.values())
+    h.update(last_scan=int(time.time()), ok_symbols=ok, total_symbols=len(dfs))
+    if ok == 0:
+        h["fail_streak"] += 1
+        if h["fail_streak"] >= 3 and not h["alerted"]:
+            h["alerted"] = True
+            await notify_admins(context, f"⚠️ دریافت داده از {cfg.exchange} {h['fail_streak']} بار پشت‌سرهم کاملاً ناموفق بود. "
+                                         "احتمالاً مسدودی IP/ریجن (راه‌حل: ریجن EU/Singapore یا EXCHANGE=bybit) یا قطعی شبکه.")
+    else:
+        if h["alerted"]:
+            await notify_admins(context, "✅ دریافت داده دوباره برقرار شد.")
+        h["fail_streak"], h["alerted"] = 0, False
+
+
+async def scan_job(context):
+    cfg, _ = _ctx(context)
+    lock = context.bot_data.setdefault("scan_lock", asyncio.Lock())
+    if lock.locked():
+        return
+    async with lock:
+        try:
+            async with httpx.AsyncClient() as client:
+                dfs = await fetch_all(client, cfg)
+            await record_scan_health(context, dfs)
+            await process_new_signals(context, dfs)
+            if await track_open(context, dfs):
+                await check_breaker(context)
+        except Exception:  # نباید زمان‌بندی را بکشد
+            log.exception("scan_job failed")
+
+
+async def reminder_job(context):
+    cfg, db = _ctx(context)
+    now = int(time.time())
+    try:
+        for uid, exp in db.expiring_soon(now, 2 * 86400):
+            await safe_send(context.bot, uid, "⏳ اشتراک شما کمتر از ۲ روز دیگر تمام می‌شود. برای تمدید: /buy", db)
+            db.mark_reminded(uid, exp)
+            await _sleep(RATE_SLEEP)
+        for uid, exp in db.just_expired(now):
+            await safe_send(context.bot, uid, "اشتراک شما تمام شد. برای ادامه‌ی دریافت سیگنال: /buy", db)
+            db.mark_expired_notified(uid, exp)
+            await _sleep(RATE_SLEEP)
+    except Exception:
+        log.exception("reminder_job failed")
+
+
+async def weekly_job(context):
+    """هر ۷ روز: گزارش عملکرد برای مشترکان/کانال + بکاپ دیتابیس برای ادمین."""
+    cfg, db = _ctx(context)
+    now = int(time.time())
+    try:
+        last = db.get_meta("last_weekly")
+        if last is None:                       # اولین اجرا: فقط نقطه‌ی شروع را ثبت کن
+            db.set_meta("last_weekly", now)
+            return
+        if now - int(last) < 7 * 86400:
+            return
+        p = db.performance(since=int(last))
+        if p["n"]:
+            text = perf_text(p, "گزارش هفتگی")
+            await broadcast(context.bot, db, db.active_user_ids(), text)
+            await post_channel(context, text)
+        for aid in cfg.admin_ids:
+            await send_backup(context, aid)
+        db.set_meta("last_weekly", now)
+    except Exception:
+        log.exception("weekly_job failed")
+
+
+async def heartbeat_job(context):
+    context.bot_data["heartbeat"] = time.time()
+
+
+def start_watchdog(beat_fn, max_age: float, exit_fn=None, interval: float = 30.0):
+    """
+    نخ نگهبان مستقل از event loop: اگر ضربان (heartbeat) بیش از max_age ثانیه قدیمی شود (قفل‌شدن ربات)،
+    پردازه را با کد خطا می‌بندد تا پلتفرم (Render/Railway) آن را دوباره راه بیندازد.
+    -> (thread, stop_event)  |  اگر max_age <= 0: (None, None)
+    """
+    import threading
+    if max_age <= 0:
+        return None, None
+    exit_fn = exit_fn or os._exit
+    stop = threading.Event()
+
+    def loop():
+        while not stop.wait(interval):
+            age = time.time() - beat_fn()
+            if age > max_age:
+                log.critical("watchdog: no heartbeat for %.0fs; exiting for restart", age)
+                exit_fn(1)
+                return
+
+    t = threading.Thread(target=loop, name="watchdog", daemon=True)
+    t.start()
+    return t, stop
+
+
+async def on_error(update, context):
+    log.error("handler error: %s", type(context.error).__name__, exc_info=context.error)
+
+
+# ============================================================ اجرا
+class RedactingFormatter(logging.Formatter):
+    def __init__(self, secret: str):
+        super().__init__("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        self.secret = secret
+
+    def format(self, record):
+        return super().format(record).replace(self.secret, "<TOKEN>")
+
+
+def setup_logging(token: str):
+    h = logging.StreamHandler()
+    h.setFormatter(RedactingFormatter(token))
+    logging.basicConfig(level=logging.INFO, handlers=[h], force=True)
+    for noisy in ("httpx", "httpcore", "telegram.ext"):   # URL درخواست‌ها شامل توکن است
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def build_application(cfg: Config, db: Database):
+    app = Application.builder().token(cfg.token).build()
+    app.bot_data.update(cfg=cfg, db=db, started=time.time(), heartbeat=time.time())
+    for name, fn in [("start", start), ("buy", buy), ("plans", buy), ("status", status), ("trial", trial),
+                     ("ref", ref), ("performance", performance), ("risk", risk), ("paysupport", paysupport),
+                     ("terms", terms), ("stats", stats), ("grant", grant), ("signal", signal_cmd),
+                     ("announce", announce), ("refund", refund), ("testsignals", testsignals),
+                     ("open", open_cmd), ("backtest", backtest_cmd), ("backup", backup_cmd),
+                     ("settings", settings_cmd), ("promo", promo), ("newpromo", newpromo), ("promos", promos),
+                     ("pause", pause_cmd), ("resume", resume_cmd), ("health", health_cmd)]:
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(buy_button, pattern=r"^buy:"))
+    app.add_handler(CallbackQueryHandler(settings_button, pattern=r"^set:"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.CaptionRegex(r"^/restore"), restore_handler))
+    app.add_error_handler(on_error)
+    app.job_queue.run_repeating(heartbeat_job, interval=60, first=1)
+    app.job_queue.run_repeating(scan_job, interval=cfg.scan_every, first=10)
+    app.job_queue.run_repeating(reminder_job, interval=6 * 3600, first=60)
+    app.job_queue.run_repeating(weekly_job, interval=6 * 3600, first=120)
+    return app
 
 
 def main():
-    app = Application.builder().token(TOKEN).build()
-    for name, fn in [("start", start), ("buy", buy), ("status", status), ("paysupport", paysupport),
-                     ("signal", signal_cmd), ("grant", grant), ("stats", stats), ("refund", refund)]:
-        app.add_handler(CommandHandler(name, fn))
-    app.add_handler(PreCheckoutQueryHandler(precheckout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, paid))
-    app.job_queue.run_repeating(scan, interval=SCAN_EVERY, first=10)
+    cfg = load_config()
+    setup_logging(cfg.token)
+    app = build_application(cfg, Database(cfg.db_path))
+    log.info("bot starting | exchange=%s | plans=%s | symbols=%d | tf=%s | htf=%s | db=%s | stop=%s", cfg.exchange,
+             [p.id for p in cfg.plans], len(cfg.symbols), cfg.timeframe, cfg.htf_ms, cfg.db_path, cfg.stop_mode)
+    start_watchdog(lambda: app.bot_data.get("heartbeat", 0), cfg.watchdog_seconds)
     app.run_polling()
 
 

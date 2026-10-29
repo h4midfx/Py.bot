@@ -1,116 +1,158 @@
-import numpy as np, pandas as pd
-from smc import analyze, simulate, _find_fvg
+import unittest
+import numpy as np
+import pandas as pd
+import smc
 
 
-def synth(n=3000, seed=0, drift_switch=120):
-    """قیمت مصنوعی با رژیم‌های صعودی/نزولی و نوسان متغیر"""
-    rng = np.random.default_rng(seed)
-    price, rows, drift = 100.0, [], 0.0
-    for i in range(n):
-        if i % drift_switch == 0:
-            drift = rng.normal(0, 0.0015)
-        vol = 0.004 * (1 + 0.5 * np.sin(i / 200))
-        o = price
-        c = o * (1 + drift + rng.normal(0, vol))
-        h = max(o, c) * (1 + abs(rng.normal(0, vol / 2)))
-        l = min(o, c) * (1 - abs(rng.normal(0, vol / 2)))
-        rows.append((i * 900_000, o, h, l, c))
-        price = c
-    return pd.DataFrame(rows, columns=["t", "o", "h", "l", "c"])
+def mirror(df):
+    m = df.copy()
+    m["o"], m["h"], m["l"], m["c"] = 200 - df["o"], 200 - df["l"], 200 - df["h"], 200 - df["c"]
+    return m
 
 
-def test_fvg_helper():
-    h = [10, 11, 12, 15]; l = [9, 10, 11, 13]
-    assert _find_fvg(h, l, 0, 3, "LONG")       # l[3]=13 > h[1]=11
-    h2 = [10, 11, 12, 13]; l2 = [9, 9.5, 10, 11]
-    assert not _find_fvg(h2, l2, 0, 3, "LONG")
-    print("fvg helper ok")
+HANDMADE = [
+    (100, 101, 99, 100.5), (100.5, 102, 100, 101.5), (101.5, 103, 101, 102.5), (102.5, 105, 102, 104),
+    (104, 104.5, 101.5, 102), (102, 102.5, 99.5, 100), (100, 100.5, 97, 98), (98, 98.5, 96, 97),
+    (97, 99, 96.5, 98.5), (98.5, 100, 98, 99.5), (99.5, 101, 99, 100.5), (100.5, 102, 100, 101),
+    (101, 101.5, 100, 100.2), (100.2, 104, 100, 103.8), (103.8, 107, 103.5, 106.5), (106.5, 107, 105, 106),
+    (106, 106.2, 102.5, 103), (103, 103.2, 100.0, 100.8), (100.8, 103, 100.5, 102.5), (102.5, 104, 102, 103.5),
+    (103.5, 105, 103, 104.5)]
 
 
-def test_handmade_bullish_ob():
-    """ساختار دست‌ساز: سقف و کف مشخص، بعد شکست سقف، بعد برگشت به OB"""
-    # n=2 برای کوتاه بودن
-    pts = [  # (o,h,l,c)
-        (100, 101, 99, 100.5), (100.5, 102, 100, 101.5), (101.5, 103, 101, 102.5),   # صعود تا سقف
-        (102.5, 105, 102, 104), (104, 104.5, 101.5, 102), (102, 102.5, 99.5, 100),   # سقف 105 ، ریزش
-        (100, 100.5, 97, 98), (98, 98.5, 96, 97),                                     # کف 96
-        (97, 99, 96.5, 98.5), (98.5, 100, 98, 99.5), (99.5, 101, 99, 100.5),         # بازگشت
-        (100.5, 102, 100, 101), (101, 101.5, 100, 100.2),                             # کندل نزولی (OB) نزدیک
-        (100.2, 104, 100, 103.8), (103.8, 107, 103.5, 106.5),                         # شکست 105 => BOS/CHoCH
-        (106.5, 107, 105, 106), (106, 106.2, 102.5, 103),                             # ریزش
-        (103, 103.2, 100.0, 100.8),                                                   # تماس با OB
-        (100.8, 103, 100.5, 102.5), (102.5, 104, 102, 103.5), (103.5, 105, 103, 104.5),
-    ]
-    df = pd.DataFrame([(i, *p) for i, p in enumerate(pts)], columns=["t", "o", "h", "l", "c"])
-    sigs = analyze(df, n=2, require_pd=False)
-    print("handmade signals:", [(s["side"], s["kind"], round(s["entry"], 2), round(s["sl"], 2)) for s in sigs])
-    assert any(s["side"] == "LONG" for s in sigs), "باید حداقل یک سیگنال LONG پیدا شود"
-    s = [s for s in sigs if s["side"] == "LONG"][0]
-    assert s["sl"] < s["entry"] < s["tps"][0] < s["tps"][4]
-    assert len(s["tps"]) == 5
-    r = abs(s["entry"] - s["sl"])
-    assert abs((s["tps"][4] - s["entry"]) - 5 * r) < 1e-9
+def handmade_df():
+    return pd.DataFrame([(i, *p) for i, p in enumerate(HANDMADE)], columns=["t", "o", "h", "l", "c"])
 
 
-def test_no_lookahead():
-    """سیگنال‌ها نباید با اضافه‌شدن کندل‌های آینده تغییر کنند (no repaint)"""
-    df = synth(2500, seed=3)
-    full = {(s["idx"], s["side"], round(s["entry"], 8)) for s in analyze(df)}
-    for cut in (800, 1400, 2000):
-        part = {(s["idx"], s["side"], round(s["entry"], 8)) for s in analyze(df.iloc[:cut].reset_index(drop=True))}
-        in_full = {x for x in full if x[0] < cut}
-        assert part == in_full, f"repaint در cut={cut}: {part ^ in_full}"
-    print("no-lookahead ok, total signals:", len(full))
+def geometry_ok(s):
+    t = s["tps"]
+    if s["side"] == "LONG":
+        return s["sl"] < s["entry"] < t[0] < t[1] < t[2] < t[3] < t[4]
+    return s["sl"] > s["entry"] > t[0] > t[1] > t[2] > t[3] > t[4]
 
 
-def test_tp_geometry_and_sides():
-    sigs = analyze(synth(4000, seed=7))
-    assert sigs, "روی داده‌ی مصنوعی باید سیگنال تولید شود"
-    for s in sigs:
-        if s["side"] == "LONG":
-            assert s["sl"] < s["entry"] < s["tps"][0] < s["tps"][1] < s["tps"][2] < s["tps"][3] < s["tps"][4]
-        else:
-            assert s["sl"] > s["entry"] > s["tps"][0] > s["tps"][1] > s["tps"][2] > s["tps"][3] > s["tps"][4]
-    print("geometry ok:", len(sigs), "signals,",
-          sum(s["side"] == "LONG" for s in sigs), "long /", sum(s["side"] == "SHORT" for s in sigs), "short")
+class FvgTests(unittest.TestCase):
+    def test_bullish_gap(self):
+        self.assertTrue(smc._find_fvg([10, 11, 12, 15], [9, 10, 11, 13], 0, 3, "LONG"))
+
+    def test_no_gap(self):
+        self.assertFalse(smc._find_fvg([10, 11, 12, 13], [9, 9.5, 10, 11], 0, 3, "LONG"))
+
+    def test_bearish_gap(self):
+        self.assertTrue(smc._find_fvg([15, 12, 10, 9], [13, 11, 8, 7], 0, 3, "SHORT"))
 
 
-def test_simulate_known_paths():
+class StructureTests(unittest.TestCase):
+    def _padded(self, df):
+        pad = pd.DataFrame([(-100 + i, 100, 100.4, 99.6, 100) for i in range(30)], columns=["t", "o", "h", "l", "c"])
+        pad["t"] = range(30)
+        d = df.copy(); d["t"] = d["t"] + 30
+        return pd.concat([pad, d], ignore_index=True)
+
+    def test_handmade_long_and_mirror_short(self):
+        base = self._padded(handmade_df())
+        longs = [s for s in smc.analyze(base, n=2, require_pd=False) if s["side"] == "LONG"]
+        self.assertTrue(longs, "باید LONG پیدا شود")
+        shorts = [s for s in smc.analyze(mirror(base), n=2, require_pd=False) if s["side"] == "SHORT"]
+        self.assertTrue(shorts, "آینه‌ی ساختار باید SHORT بدهد")
+        for s in longs + shorts:
+            self.assertTrue(geometry_ok(s))
+            r = abs(s["entry"] - s["sl"])
+            self.assertAlmostEqual(abs(s["tps"][4] - s["entry"]), 5 * r)
+
+    def test_geometry_on_synthetic(self):
+        sigs = smc.analyze(smc.synthetic_candles(4000, 7))
+        self.assertTrue(sigs)
+        self.assertTrue(all(geometry_ok(s) for s in sigs))
+        self.assertTrue(all(1 <= s["score"] <= 4 for s in sigs))
+
+    def test_no_lookahead(self):
+        df = smc.synthetic_candles(2500, 3)
+        key = lambda s: (s["idx"], s["side"], round(s["entry"], 8))
+        full = {key(s) for s in smc.analyze(df)}
+        for cut in (800, 1400, 2000):
+            part = {key(s) for s in smc.analyze(df.iloc[:cut].reset_index(drop=True))}
+            self.assertEqual(part, {x for x in full if x[0] < cut}, f"repaint at {cut}")
+
+
+class DataGuardTests(unittest.TestCase):
+    def test_empty_and_short(self):
+        self.assertEqual(smc.analyze(pd.DataFrame(columns=["t", "o", "h", "l", "c"])), [])
+        self.assertEqual(smc.analyze(smc.synthetic_candles(20)), [])
+        self.assertEqual(smc.analyze(None), [])
+
+    def test_invalid_values(self):
+        df = smc.synthetic_candles(200)
+        bad = df.copy(); bad.loc[50, "c"] = float("nan")
+        with self.assertRaises(ValueError): smc.analyze(bad)
+        bad = df.copy(); bad.loc[50, "h"] = bad.loc[50, "l"] - 1
+        with self.assertRaises(ValueError): smc.analyze(bad)
+        bad = df.copy(); bad.loc[50, "o"] = -1
+        with self.assertRaises(ValueError): smc.analyze(bad)
+        bad = df.copy(); bad.loc[50, "t"] = bad.loc[49, "t"]
+        with self.assertRaises(ValueError): smc.analyze(bad)
+        with self.assertRaises(ValueError): smc.analyze(df.drop(columns=["c"]))
+
+    def test_klines_parsing(self):
+        raw = [[i * 900000, "100", "101", "99", "100.5", "5", i * 900000 + 899999, "0", 1, "0", "0", "0"] for i in range(5)]
+        df = smc.klines_to_df(raw, now_ms=4 * 900000 + 100)      # آخرین کندل هنوز بسته نشده
+        self.assertEqual(len(df), 4)
+        for bad in ([], None, "x", [[1, 2]], [[0, "a", "b", "c", "d", "e", 1]]):
+            with self.assertRaises(ValueError): smc.klines_to_df(bad)
+
+
+class OutcomeTests(unittest.TestCase):
     base = dict(idx=0, side="LONG", entry=100.0, sl=99.0, tps=[101, 102, 103, 104, 105])
-    # همه TPها
-    df = pd.DataFrame({"t": range(3), "o": [100] * 3, "h": [100, 106, 106], "l": [100, 100, 100], "c": [100, 105, 105]})
-    r = simulate(base, df); assert r["hits"] == 5 and abs(r["r"] - 3.0) < 1e-9, r
-    # SL مستقیم
-    df = pd.DataFrame({"t": range(2), "o": [100] * 2, "h": [100, 100.5], "l": [100, 98.9], "c": [100, 99]})
-    r = simulate(base, df); assert r["stopped"] and abs(r["r"] + 1.0) < 1e-9, r
-    # TP1 و TP2 بعد SL  => 0.2*1+0.2*2 - 0.2*3 = 0
-    df = pd.DataFrame({"t": range(3), "o": [100] * 3, "h": [100, 102.5, 102], "l": [100, 100, 98.9], "c": [100, 102, 99]})
-    r = simulate(base, df); assert r["hits"] == 2 and r["stopped"] and abs(r["r"]) < 1e-9, r
-    # کندلی که هم SL و هم TP را لمس کند => SL اول
-    df = pd.DataFrame({"t": range(2), "o": [100] * 2, "h": [100, 106], "l": [100, 98], "c": [100, 100]})
-    r = simulate(base, df); assert r["stopped"] and r["hits"] == 0, r
-    print("simulate ok")
+
+    def sim(self, h, l, c, sig=None):
+        n = len(h)
+        return smc.simulate(sig or self.base, pd.DataFrame({"t": range(n), "o": [100] * n, "h": h, "l": l, "c": c}))
+
+    def test_all_targets(self):
+        r = self.sim([100, 106, 106], [100, 100, 100], [100, 105, 105])
+        self.assertEqual((r["hits"], r["outcome"]), (5, "done")); self.assertAlmostEqual(r["r"], 3.0)
+
+    def test_stop_loss(self):
+        r = self.sim([100, 100.5], [100, 98.9], [100, 99])
+        self.assertTrue(r["stopped"]); self.assertAlmostEqual(r["r"], -1.0)
+
+    def test_two_targets_then_stop(self):
+        r = self.sim([100, 102.5, 102], [100, 100, 98.9], [100, 102, 99])
+        self.assertEqual(r["hits"], 2); self.assertTrue(r["stopped"]); self.assertAlmostEqual(r["r"], 0.0)
+
+    def test_same_candle_stop_wins(self):
+        r = self.sim([100, 106], [100, 98], [100, 100])
+        self.assertTrue(r["stopped"]); self.assertEqual(r["hits"], 0)
+
+    def test_short_side(self):
+        sig = dict(idx=0, side="SHORT", entry=100.0, sl=101.0, tps=[99, 98, 97, 96, 95])
+        r = self.sim([100, 100.2], [100, 94], [100, 95], sig)
+        self.assertEqual(r["hits"], 5)
+
+    def test_expired_marks_to_market(self):
+        r = self.sim([100, 100.5], [100, 99.5], [100, 100.5])
+        self.assertEqual(r["outcome"], "expired"); self.assertAlmostEqual(r["r"], 0.5)
+
+    def test_advance_reports_events_in_order(self):
+        hits, ev, out, used = smc.advance("LONG", 99, [101, 102, 103, 104, 105], 0, [101.5, 103.2], [100, 100])
+        self.assertEqual((hits, out, used), (3, None, 2))
+        self.assertEqual(ev, [("tp", 1), ("tp", 2), ("tp", 3)])
+
+    def test_each_target_only_once_across_calls(self):
+        h1, e1, _, _ = smc.advance("LONG", 99, [101, 102, 103, 104, 105], 0, [101.5], [100])
+        h2, e2, _, _ = smc.advance("LONG", 99, [101, 102, 103, 104, 105], h1, [101.6], [100])
+        self.assertEqual(e1, [("tp", 1)]); self.assertEqual(e2, [])
 
 
-def test_backtest_stats():
-    allr, hits = [], np.zeros(6, int)
-    for seed in range(8):
-        df = synth(4000, seed=seed)
-        for s in analyze(df):
-            res = simulate(s, df)
-            allr.append(res["r"]); hits[res["hits"]] += 1
-    allr = np.array(allr)
-    print(f"[داده مصنوعی/تصادفی] تعداد سیگنال={len(allr)}  میانگین R={allr.mean():+.3f}  "
-          f"وین‌ریت(R>0)={(allr>0).mean():.1%}")
-    print("توزیع تعداد TP لمس‌شده (0..5):", hits.tolist())
-    # روی داده‌ی تصادفی نباید ادعای سود کنیم؛ فقط بررسی می‌کنیم کد سالم اجرا می‌شود
-    assert len(allr) > 20
+class BacktestTests(unittest.TestCase):
+    def test_backtest_runs_without_profit_claim(self):
+        rs = []
+        for seed in range(6):
+            df = smc.synthetic_candles(4000, seed, trending=False)
+            rs += [smc.simulate(s, df)["r"] for s in smc.analyze(df)]
+        self.assertGreater(len(rs), 20)
+        self.assertTrue(np.isfinite(rs).all())
+        print(f"\n[بک‌تست مصنوعی بدون روند] n={len(rs)} avgR={np.mean(rs):+.3f} (فقط برای سلامت کد؛ نه سودآوری)")
 
 
 if __name__ == "__main__":
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            try:
-                fn(); print("PASS", name)
-            except AssertionError as e:
-                print("FAIL", name, "->", e)
+    unittest.main()
